@@ -6,7 +6,7 @@ data:
   config.toml: |
     [discord]
     bot_token = "${DISCORD_BOT_TOKEN}"
-    allowed_channels = ["YOUR_CHANNEL_ID"]
+    allowed_channels = ["YOUR_CHANNEL_ID", "1491365158868619404"]
 
     [agent]
     command = "kiro-cli"
@@ -21,10 +21,15 @@ data:
     enabled = true
     remove_after_reply = false
 
-    [[cronjobs]]
+    [cron]
+    usercron_enabled = false
+
+    [[cron.jobs]]
+    enabled = true
     schedule = "*/30 * * * *"
-    channel = "1491969620754567270"
-    message = "Check for any new messages in this Slack discussion thread. If there are new messages since your last check, ping <@196299853884686336> with a summary of what needs decisions."
+    channel = "1491365158868619404"
+    message = "Check for any new messages in the Slack support thread (1491969620754567270). If there are new messages since your last check, ping <@196299853884686336> with a summary of what needs decisions."
     platform = "discord"
     sender_name = "SlackMonitor"
-    enabled = true
+    timezone = "Asia/Taipei"
+    thread_id = "1491969620754567270"

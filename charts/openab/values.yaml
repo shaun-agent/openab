@@ -33,6 +33,7 @@ discord:
   #   helm install ... --set-string discord.allowedChannels[0]="<CHANNEL_ID>"
   allowedChannels:
     - "YOUR_CHANNEL_ID"
+    - "1491365158868619404"
 
 agent:
   preset: ""              # kiro (default), codex, or claude — auto-configures image + command
@@ -54,11 +55,13 @@ reactions:
 
 cronjobs:
   - schedule: "*/30 * * * *"
-    channel: "1491969620754567270"
-    message: "Check for any new messages in this Slack discussion thread. If there are new messages since your last check, ping <@196299853884686336> with a summary of what needs decisions."
+    channel: "1491365158868619404"
+    message: "Check for any new messages in the Slack support thread (1491969620754567270). If there are new messages since your last check, ping <@196299853884686336> with a summary of what needs decisions."
     platform: "discord"
     senderName: "SlackMonitor"
     enabled: true
+    timezone: "Asia/Taipei"
+    threadId: "1491969620754567270"
 
 agentsMd: ""
   # agentsMd: |

@@ -20,3 +20,11 @@ data:
     [reactions]
     enabled = true
     remove_after_reply = false
+
+    [[cronjobs]]
+    schedule = "*/30 * * * *"
+    channel = "1491969620754567270"
+    message = "Check for any new messages in this Slack discussion thread. If there are new messages since your last check, ping <@196299853884686336> with a summary of what needs decisions."
+    platform = "discord"
+    sender_name = "SlackMonitor"
+    enabled = true

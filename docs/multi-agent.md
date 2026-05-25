@@ -63,6 +63,31 @@ By default, each agent ignores messages from other bots. To enable multi-agent c
 allow_bot_messages = "mentions"  # recommended
 ```
 
+### Use bot user mentions, not same-named roles
+
+For bot-to-bot handoffs, mention the receiving bot user directly. In Discord's
+wire format this looks like `<@BOT_USER_ID>`, not `<@&ROLE_ID>`.
+
+This distinction matters because Discord allows a bot user and a role to have
+the same visible name. If both are named `ReviewBot`, Discord's autocomplete (or
+copied LLM-generated prompts) can select the role instead of the bot user. The
+message will look right to a human, but the receiving bot may not be directly
+mentioned, so `allow_bot_messages = "mentions"` will not trigger the intended
+bot.
+
+Recommended practice:
+
+- Give roles distinct names, such as `ReviewBots` or `AllAgents`, not the exact
+  same name as a bot user.
+- Use direct bot-user mentions for one-to-one handoffs.
+- Use role mentions only for intentional fan-out, and only when that role ID is
+  listed in `allowed_role_ids`.
+- For prompt templates, prefer raw mention IDs:
+
+```text
+<@123456789012345678> please review this branch and reply DONE/BLOCKED.
+```
+
 ### Modes
 
 | Value | Behavior | Loop risk |

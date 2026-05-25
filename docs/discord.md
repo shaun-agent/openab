@@ -182,6 +182,36 @@ The bot responds to:
 
 The triggering role mention is stripped from the prompt sent to the agent (same as the bot's own user mention).
 
+### Avoid role/user name collisions
+
+Discord role mentions and bot user mentions are different objects:
+
+```text
+<@123456789012345678>   = user or bot user mention
+<@&123456789012345678>  = role mention
+```
+
+Avoid giving a role the exact same display name as a bot. If a role and bot are
+both named `Kiro`, autocomplete or copied prompt text may select the role
+mention when the user intended to mention the bot. That can silently break
+bot-to-bot flows in `allow_bot_messages = "mentions"` mode because the receiving
+bot was not actually mentioned.
+
+Use direct bot-user mentions for targeted handoffs:
+
+```text
+<@BOT_USER_ID> please review the patch and reply DONE/BLOCKED.
+```
+
+Use role mentions only for deliberate fan-out:
+
+```text
+@AllAgents please review this plan.
+```
+
+When using role fan-out, give the role a group name (`AllAgents`, `ReviewBots`,
+`DeployBots`) and configure its ID in `allowed_role_ids`.
+
 ### User mention UIDs
 
 When a user mentions another user (e.g. `@SomeUser`) in a message to the bot, the raw Discord mention `<@UID>` is preserved in the prompt sent to the LLM. This means:

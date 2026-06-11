@@ -347,6 +347,21 @@ impl Adapter {
         }
     }
 
+    fn extract_error_from_step_payload(blob: &[u8]) -> Option<String> {
+        let mut candidates = Vec::new();
+        Self::collect_proto_text_candidates(blob, 0, &mut candidates);
+        for candidate in candidates {
+            let text = candidate.trim();
+            if text.contains("RESOURCE_EXHAUSTED")
+                || text.contains("Individual quota reached")
+                || text.contains("HTTP 429")
+            {
+                return Some(format!("Antigravity error: {}", text));
+            }
+        }
+        None
+    }
+
     /// Read the latest response from the SQLite conversation DB.
     /// Returns (response_text, max_step_idx) or None if reading fails.
     fn read_response_from_db(
@@ -379,28 +394,42 @@ impl Adapter {
             return None;
         }
 
-        let mut stmt = conn.prepare(
-            "SELECT idx, step_payload FROM steps WHERE idx > ?1 AND step_type = 15 ORDER BY idx"
-        ).ok()?;
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map([after_step_idx], |row| Ok((row.get(0)?, row.get(1)?)))
+        let mut stmt = conn
+            .prepare("SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 AND step_type IN (15, 17) ORDER BY idx")
+            .ok()?;
+        let rows: Vec<(i64, i64, Vec<u8>)> = stmt
+            .query_map([after_step_idx], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
 
         let mut max_idx = after_step_idx;
         let mut response_parts: Vec<String> = Vec::new();
-        for (idx, payload) in &rows {
+        let mut error_parts: Vec<String> = Vec::new();
+        for (idx, step_type, payload) in &rows {
             max_idx = max_idx.max(*idx);
-            if let Some(text) = Self::extract_text_from_step_payload(payload) {
-                if !text.is_empty() {
-                    response_parts.push(text);
+            if *step_type == 15 {
+                if let Some(text) = Self::extract_text_from_step_payload(payload) {
+                    if !text.is_empty() {
+                        response_parts.push(text);
+                    }
+                }
+            } else if *step_type == 17 {
+                if let Some(text) = Self::extract_error_from_step_payload(payload) {
+                    if !text.is_empty() {
+                        error_parts.push(text);
+                    }
                 }
             }
         }
         if response_parts.is_empty() {
+            if !error_parts.is_empty() {
+                return Some((error_parts.join("\n"), max_idx));
+            }
             if !rows.is_empty() {
-                let payload_sizes: Vec<usize> = rows.iter().map(|(_, p)| p.len()).collect();
+                let payload_sizes: Vec<usize> = rows.iter().map(|(_, _, p)| p.len()).collect();
                 eprintln!(
                     "[agy-acp] WARN: {} new steps found (payload sizes: {:?}) but none had extractable text \
                      (field 20.1 missing — schema change?)",
@@ -1166,6 +1195,41 @@ mod tests {
         assert_eq!(
             Adapter::extract_text_from_step_payload(&payload),
             Some("actual assistant reply".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_error_from_step_payload_returns_quota_error() {
+        fn len_field(field_number: u64, bytes: &[u8]) -> Vec<u8> {
+            fn push_varint(mut value: u64, out: &mut Vec<u8>) {
+                loop {
+                    if value < 128 {
+                        out.push(value as u8);
+                        break;
+                    }
+                    out.push(((value as u8) & 0x7f) | 0x80);
+                    value >>= 7;
+                }
+            }
+
+            let mut out = Vec::new();
+            push_varint((field_number << 3) | 2, &mut out);
+            push_varint(bytes.len() as u64, &mut out);
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        let payload = len_field(
+            12,
+            b"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 147h31m5s.",
+        );
+
+        assert_eq!(
+            Adapter::extract_error_from_step_payload(&payload),
+            Some(
+                "Antigravity error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 147h31m5s."
+                    .to_string()
+            )
         );
     }
 

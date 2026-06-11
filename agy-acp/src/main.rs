@@ -108,9 +108,10 @@ impl Adapter {
     /// Try to restore conversation_id and last_step_idx from persisted state.
     fn restore_session(&self, session_id: &str) -> Option<(String, i64)> {
         let store = self.load_store();
-        store.sessions.get(session_id).and_then(|s| {
-            s.conversation_id.clone().map(|cid| (cid, s.last_step_idx))
-        })
+        store
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.conversation_id.clone().map(|cid| (cid, s.last_step_idx)))
     }
 
     /// Persist a session binding (read-modify-write under single lock).
@@ -167,11 +168,26 @@ impl Adapter {
         Some(created.remove(0).clone())
     }
 
-    /// Extract text from a step_payload protobuf: top-level field 20 (sub-message) → field 1 (string).
+    /// Extract text from a step_payload protobuf.
+    ///
+    /// agy v1.0.4 stored response text at top-level field 20 (sub-message) →
+    /// field 1 (string). Newer releases have moved fields around, so keep that
+    /// fast path but fall back to scanning nested length-delimited fields for
+    /// plausible UTF-8 text.
     fn extract_text_from_step_payload(blob: &[u8]) -> Option<String> {
-        let field_20 = Self::get_proto_field(blob, 20)?;
-        let field_1 = Self::get_proto_field(&field_20, 1)?;
-        String::from_utf8(field_1).ok()
+        if let Some(field_20) = Self::get_proto_field(blob, 20) {
+            if let Some(field_1) = Self::get_proto_field(&field_20, 1) {
+                if let Ok(text) = String::from_utf8(field_1) {
+                    if Self::is_plausible_response_text(&text) {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+
+        let mut candidates = Vec::new();
+        Self::collect_proto_text_candidates(blob, 0, &mut candidates);
+        candidates.into_iter().max_by_key(|text| text.trim().len())
     }
 
     /// Extract the first length-delimited field with the given number from a protobuf blob.
@@ -183,19 +199,28 @@ impl Adapter {
             let field_number = tag >> 3;
             let wire_type = tag & 0x7;
             match wire_type {
-                0 => { let (_, c) = Self::read_varint(&blob[i..])?; i += c; }
+                0 => {
+                    let (_, c) = Self::read_varint(&blob[i..])?;
+                    i += c;
+                }
                 2 => {
                     let (len, c) = Self::read_varint(&blob[i..])?;
                     i += c;
                     let len = len as usize;
-                    if i + len > blob.len() { return None; }
+                    if i + len > blob.len() {
+                        return None;
+                    }
                     if field_number == target {
                         return Some(blob[i..i + len].to_vec());
                     }
                     i += len;
                 }
-                5 => { i += 4; }
-                1 => { i += 8; }
+                5 => {
+                    i += 4;
+                }
+                1 => {
+                    i += 8;
+                }
                 _ => return None,
             }
         }
@@ -219,32 +244,142 @@ impl Adapter {
         None
     }
 
+    fn collect_proto_text_candidates(blob: &[u8], depth: usize, out: &mut Vec<String>) {
+        const MAX_PROTO_SCAN_DEPTH: usize = 6;
+        if depth > MAX_PROTO_SCAN_DEPTH {
+            return;
+        }
+
+        let mut i = 0;
+        while i < blob.len() {
+            let Some((tag, consumed)) = Self::read_varint(&blob[i..]) else {
+                return;
+            };
+            i += consumed;
+            let wire_type = tag & 0x7;
+
+            match wire_type {
+                0 => {
+                    let Some((_, consumed)) = Self::read_varint(&blob[i..]) else {
+                        return;
+                    };
+                    i += consumed;
+                }
+                2 => {
+                    let Some((len, consumed)) = Self::read_varint(&blob[i..]) else {
+                        return;
+                    };
+                    i += consumed;
+                    let len = len as usize;
+                    if i + len > blob.len() {
+                        return;
+                    }
+                    let bytes = &blob[i..i + len];
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        if Self::is_plausible_response_text(text) {
+                            out.push(text.trim().to_string());
+                        }
+                    }
+                    Self::collect_proto_text_candidates(bytes, depth + 1, out);
+                    i += len;
+                }
+                5 => {
+                    i = i.saturating_add(4);
+                    if i > blob.len() {
+                        return;
+                    }
+                }
+                1 => {
+                    i = i.saturating_add(8);
+                    if i > blob.len() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn is_plausible_response_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.len() < 2 {
+            return false;
+        }
+        if trimmed.contains('\0') {
+            return false;
+        }
+        if trimmed
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+        {
+            return false;
+        }
+
+        let printable = trimmed
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+            .count();
+        printable * 100 / trimmed.chars().count().max(1) >= 90
+    }
+
+    fn stdout_fallback_text(stdout: &str) -> Option<String> {
+        let parts: Vec<String> = stdout
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(String::from)
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let filtered = Self::filter_narration(&parts);
+        if filtered.trim().is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    }
+
     /// Read the latest response from the SQLite conversation DB.
     /// Returns (response_text, max_step_idx) or None if reading fails.
-    fn read_response_from_db(&self, conversation_id: &str, after_step_idx: i64) -> Option<(String, i64)> {
-        let db_path = self.conversations_dir.join(format!("{}.db", conversation_id));
+    fn read_response_from_db(
+        &self,
+        conversation_id: &str,
+        after_step_idx: i64,
+    ) -> Option<(String, i64)> {
+        let db_path = self
+            .conversations_dir
+            .join(format!("{}.db", conversation_id));
         let conn = Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ).ok()?;
+        )
+        .ok()?;
 
         // Verify steps table exists
-        let table_exists: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='steps'",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='steps'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
         if !table_exists {
-            eprintln!("[agy-acp] WARN: steps table not found in {}.db — schema changed?", conversation_id);
+            eprintln!(
+                "[agy-acp] WARN: steps table not found in {}.db — schema changed?",
+                conversation_id
+            );
             return None;
         }
 
         let mut stmt = conn.prepare(
             "SELECT idx, step_payload FROM steps WHERE idx > ?1 AND step_type = 15 ORDER BY idx"
         ).ok()?;
-        let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([after_step_idx], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).ok()?.filter_map(|r| r.ok()).collect();
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([after_step_idx], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let mut max_idx = after_step_idx;
         let mut response_parts: Vec<String> = Vec::new();
@@ -288,7 +423,10 @@ impl Adapter {
         }
 
         // Find the first part that is NOT pure narration. Keep it and everything after.
-        let first_content = parts.iter().position(|p| !Self::is_narration(p)).unwrap_or(parts.len() - 1);
+        let first_content = parts
+            .iter()
+            .position(|p| !Self::is_narration(p))
+            .unwrap_or(parts.len() - 1);
         parts[first_content..].join("\n")
     }
 
@@ -494,26 +632,34 @@ impl Adapter {
                     }
                 }
 
-                let bound_conv_id = self.sessions.get(session_id).and_then(|s| s.conversation_id.clone());
-                let last_step_idx = self.sessions.get(session_id).map(|s| s.last_step_idx).unwrap_or(-1);
+                let bound_conv_id = self
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.conversation_id.clone());
+                let last_step_idx = self
+                    .sessions
+                    .get(session_id)
+                    .map(|s| s.last_step_idx)
+                    .unwrap_or(-1);
 
                 // Read response delta from SQLite
                 let (new_text, new_step_idx) = if let Some(cid) = &bound_conv_id {
                     match self.read_response_from_db(cid, last_step_idx) {
                         Some((text, idx)) => {
-                            eprintln!("[agy-acp] delta from SQLite (steps {} → {})", last_step_idx, idx);
+                            eprintln!(
+                                "[agy-acp] delta from SQLite (steps {} → {})",
+                                last_step_idx, idx
+                            );
                             (Some(text), idx)
                         }
                         None => {
                             eprintln!("[agy-acp] WARN: SQLite read returned no new text (field 20.1 missing?)");
-                            (None, last_step_idx)
+                            (Self::stdout_fallback_text(&full_text), last_step_idx)
                         }
                     }
                 } else {
                     eprintln!("[agy-acp] WARN: could not bind conversation ID; single-turn mode");
-                    let parts: Vec<String> = full_text.split("\n\n").map(String::from).collect();
-                    let filtered = Self::filter_narration(&parts);
-                    (Some(filtered), -1i64)
+                    (Self::stdout_fallback_text(&full_text), -1i64)
                 };
 
                 // Persist session state
@@ -554,7 +700,9 @@ impl Adapter {
                             jsonrpc: "2.0",
                             id,
                             result: None,
-                            error: Some(json!({"code":-32001,"message":"agy responded but response extraction failed — possible schema change in conversation DB (field 20.1)"})),
+                            error: Some(
+                                json!({"code":-32001,"message":"agy responded but no extractable text was found in SQLite or stdout"}),
+                            ),
                         };
                         output_lines.push(serde_json::to_string(&resp).unwrap());
                     }
@@ -659,16 +807,22 @@ mod tests {
     fn test_extract_text_from_step_payload_field20_field1() {
         // field 20 (tag 0xA2 0x01), containing sub-message with field 1 = "hello"
         let mut inner = Vec::new();
-        inner.push(0x0A); inner.push(0x05); // field 1, LEN, 5 bytes
+        inner.push(0x0A);
+        inner.push(0x05); // field 1, LEN, 5 bytes
         inner.extend_from_slice(b"hello");
 
         let mut blob = Vec::new();
-        blob.push(0x08); blob.push(0x0F); // field 1 varint = 15
-        // field 20, wire type 2: tag = (20 << 3) | 2 = 0xA2, needs varint encoding: 0xA2 0x01
-        blob.push(0xA2); blob.push(0x01);
+        blob.push(0x08);
+        blob.push(0x0F); // field 1 varint = 15
+                         // field 20, wire type 2: tag = (20 << 3) | 2 = 0xA2, needs varint encoding: 0xA2 0x01
+        blob.push(0xA2);
+        blob.push(0x01);
         blob.push(inner.len() as u8);
         blob.extend_from_slice(&inner);
-        assert_eq!(Adapter::extract_text_from_step_payload(&blob), Some("hello".to_string()));
+        assert_eq!(
+            Adapter::extract_text_from_step_payload(&blob),
+            Some("hello".to_string())
+        );
     }
 
     #[test]
@@ -687,14 +841,19 @@ mod tests {
         inner.extend_from_slice(text);
 
         let mut blob = Vec::new();
-        blob.push(0x08); blob.push(0x01); // field 1 varint
-        // field 20
-        blob.push(0xA2); blob.push(0x01);
+        blob.push(0x08);
+        blob.push(0x01); // field 1 varint
+                         // field 20
+        blob.push(0xA2);
+        blob.push(0x01);
         blob.push(inner.len() as u8);
         blob.extend_from_slice(&inner);
         assert_eq!(
             Adapter::extract_text_from_step_payload(&blob),
-            Some("Safe memory rules\nCompiler points out the flaws\nFast and fearless code".to_string())
+            Some(
+                "Safe memory rules\nCompiler points out the flaws\nFast and fearless code"
+                    .to_string()
+            )
         );
     }
 
@@ -737,7 +896,10 @@ mod tests {
         let response = adapter.handle_session_load(7, &json!({"sessionId": "sess-1"}));
         assert!(response.error.is_none());
         assert_eq!(
-            adapter.sessions.get("sess-1").and_then(|s| s.conversation_id.as_deref()),
+            adapter
+                .sessions
+                .get("sess-1")
+                .and_then(|s| s.conversation_id.as_deref()),
             Some("conv-abc")
         );
         assert_eq!(
@@ -764,7 +926,11 @@ mod tests {
         let response = adapter.handle_session_load(9, &json!({"sessionId": "missing"}));
         assert!(response.result.is_none());
         assert_eq!(
-            response.error.as_ref().and_then(|e| e.get("message")).and_then(|m| m.as_str()),
+            response
+                .error
+                .as_ref()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str()),
             Some("unknown sessionId: missing")
         );
 
@@ -869,29 +1035,35 @@ mod tests {
                 render_info BLOB,
                 step_payload BLOB,
                 step_format INTEGER NOT NULL DEFAULT 0
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert a step_type=15 step with field 20 → field 1 containing "hello world"
         let mut inner = Vec::new();
-        inner.push(0x0A); inner.push(11); // field 1, LEN, 11 bytes
+        inner.push(0x0A);
+        inner.push(11); // field 1, LEN, 11 bytes
         inner.extend_from_slice(b"hello world");
         let mut payload = Vec::new();
-        payload.push(0x08); payload.push(0x0F); // field 1 varint = 15
-        payload.push(0xA2); payload.push(0x01); // field 20, LEN
+        payload.push(0x08);
+        payload.push(0x0F); // field 1 varint = 15
+        payload.push(0xA2);
+        payload.push(0x01); // field 20, LEN
         payload.push(inner.len() as u8);
         payload.extend_from_slice(&inner);
 
         conn.execute(
             "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
             rusqlite::params![1i64, payload],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert a non-response step (step_type=14) — should be ignored
         conn.execute(
             "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
             rusqlite::params![2i64, vec![0x08u8, 0x0E]],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let adapter = Adapter {
@@ -911,10 +1083,55 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn test_extract_text_from_step_payload_falls_back_to_nested_string() {
+        fn len_field(field_number: u64, bytes: &[u8]) -> Vec<u8> {
+            fn push_varint(mut value: u64, out: &mut Vec<u8>) {
+                loop {
+                    if value < 128 {
+                        out.push(value as u8);
+                        break;
+                    }
+                    out.push(((value as u8) & 0x7f) | 0x80);
+                    value >>= 7;
+                }
+            }
+
+            let mut out = Vec::new();
+            push_varint((field_number << 3) | 2, &mut out);
+            push_varint(bytes.len() as u64, &mut out);
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        let nested = len_field(7, b"schema moved response text");
+        let payload = len_field(31, &nested);
+
+        assert_eq!(
+            Adapter::extract_text_from_step_payload(&payload),
+            Some("schema moved response text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stdout_fallback_filters_empty_and_narration() {
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let stdout = "\n\nI will inspect the repo.\n\nGitHub CLI is installed and authenticated.\n";
+        assert_eq!(
+            Adapter::stdout_fallback_text(stdout),
+            Some("GitHub CLI is installed and authenticated.".to_string())
+        );
+        assert_eq!(Adapter::stdout_fallback_text("\n\n"), None);
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+    }
+
     /// Check auth is available: either GEMINI_API_KEY env var or local keyring.
     /// Returns true if auth is ready, false to skip the test.
     fn prepare_auth() -> bool {
-        if std::env::var("GEMINI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("GEMINI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             eprintln!("[e2e] Using GEMINI_API_KEY");
             return true;
         }
@@ -949,7 +1166,9 @@ mod tests {
             return;
         }
 
-        let binary = std::env::current_dir().unwrap().join("target/release/agy-acp");
+        let binary = std::env::current_dir()
+            .unwrap()
+            .join("target/release/agy-acp");
         if !binary.exists() {
             panic!("Run `cargo build --release` first");
         }
@@ -975,7 +1194,9 @@ mod tests {
         };
 
         // 1. Initialize
-        let resp = send_and_recv(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#);
+        let resp = send_and_recv(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
+        );
         let init: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(init["result"]["protocolVersion"], 1);
 
@@ -1035,29 +1256,46 @@ mod tests {
     }
 
     /// Helper: spawn agy-acp, return (stdin, reader, child)
-    fn spawn_agy_acp() -> Option<(std::process::ChildStdin, std::io::BufReader<std::process::ChildStdout>, std::process::Child)> {
+    fn spawn_agy_acp() -> Option<(
+        std::process::ChildStdin,
+        std::io::BufReader<std::process::ChildStdout>,
+        std::process::Child,
+    )> {
         use std::io::BufReader;
         use std::process::{Command, Stdio};
 
-        if !prepare_auth() { return None; }
+        if !prepare_auth() {
+            return None;
+        }
         let agy_check = Command::new("agy").arg("--help").output();
         if agy_check.is_err() || !agy_check.unwrap().status.success() {
             eprintln!("SKIP: agy not found in PATH");
             return None;
         }
-        let binary = std::env::current_dir().unwrap().join("target/release/agy-acp");
-        if !binary.exists() { panic!("Run `cargo build --release` first"); }
+        let binary = std::env::current_dir()
+            .unwrap()
+            .join("target/release/agy-acp");
+        if !binary.exists() {
+            panic!("Run `cargo build --release` first");
+        }
 
         let mut child = Command::new(&binary)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().expect("failed to spawn agy-acp");
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn agy-acp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Some((stdin, BufReader::new(stdout), child))
     }
 
     /// Helper: send JSON-RPC and read one response line
-    fn send_recv(stdin: &mut std::process::ChildStdin, reader: &mut std::io::BufReader<std::process::ChildStdout>, msg: &str) -> String {
+    fn send_recv(
+        stdin: &mut std::process::ChildStdin,
+        reader: &mut std::io::BufReader<std::process::ChildStdout>,
+        msg: &str,
+    ) -> String {
         use std::io::{BufRead, Write};
         writeln!(stdin, "{}", msg).unwrap();
         stdin.flush().unwrap();
@@ -1067,7 +1305,13 @@ mod tests {
     }
 
     /// Helper: send a prompt and wait for the response (notification + final reply)
-    fn send_prompt_wait(stdin: &mut std::process::ChildStdin, reader: &mut std::io::BufReader<std::process::ChildStdout>, id: u64, session_id: &str, text: &str) -> (Option<String>, Value) {
+    fn send_prompt_wait(
+        stdin: &mut std::process::ChildStdin,
+        reader: &mut std::io::BufReader<std::process::ChildStdout>,
+        id: u64,
+        session_id: &str,
+        text: &str,
+    ) -> (Option<String>, Value) {
         use std::io::{BufRead, Write};
         use std::time::Duration;
 
@@ -1081,13 +1325,20 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let mut notification_text: Option<String> = None;
         loop {
-            if std::time::Instant::now() > deadline { panic!("Timed out"); }
+            if std::time::Instant::now() > deadline {
+                panic!("Timed out");
+            }
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
-            if line.is_empty() { std::thread::sleep(Duration::from_millis(100)); continue; }
+            if line.is_empty() {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             let msg: Value = serde_json::from_str(line.trim()).unwrap();
             if msg.get("method") == Some(&json!("session/update")) {
-                notification_text = msg["params"]["update"]["content"]["text"].as_str().map(String::from);
+                notification_text = msg["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(String::from);
             }
             if msg.get("id") == Some(&json!(id)) {
                 return (notification_text, msg);
@@ -1099,25 +1350,54 @@ mod tests {
     #[test]
     #[ignore]
     fn test_e2e_multi_turn() {
-        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else { return };
+        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else {
+            return;
+        };
 
         // Initialize
-        send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#);
+        send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
+        );
 
         // Session new
-        let resp = send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#);
-        let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"].as_str().unwrap().to_string();
+        let resp = send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
+        );
+        let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // First prompt: set a context
-        let (text1, resp1) = send_prompt_wait(&mut stdin, &mut reader, 3, &session_id, "Remember this word: BANANA. Reply OK.");
+        let (text1, resp1) = send_prompt_wait(
+            &mut stdin,
+            &mut reader,
+            3,
+            &session_id,
+            "Remember this word: BANANA. Reply OK.",
+        );
         assert!(resp1["error"].is_null(), "Turn 1 error: {}", resp1["error"]);
         assert!(text1.is_some());
 
         // Second prompt: ask it to recall — this exercises --conversation reuse
-        let (text2, resp2) = send_prompt_wait(&mut stdin, &mut reader, 4, &session_id, "What word did I ask you to remember? Reply with just that word.");
+        let (text2, resp2) = send_prompt_wait(
+            &mut stdin,
+            &mut reader,
+            4,
+            &session_id,
+            "What word did I ask you to remember? Reply with just that word.",
+        );
         assert!(resp2["error"].is_null(), "Turn 2 error: {}", resp2["error"]);
         let reply = text2.unwrap_or_default().to_lowercase();
-        assert!(reply.contains("banana"), "Expected 'BANANA' in multi-turn reply, got: '{}'", reply);
+        assert!(
+            reply.contains("banana"),
+            "Expected 'BANANA' in multi-turn reply, got: '{}'",
+            reply
+        );
 
         drop(stdin);
         let _ = child.wait();
@@ -1127,21 +1407,54 @@ mod tests {
     #[test]
     #[ignore]
     fn test_e2e_session_load() {
-        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else { return };
+        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else {
+            return;
+        };
 
-        send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#);
-        let resp = send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#);
-        let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"].as_str().unwrap().to_string();
+        send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
+        );
+        let resp = send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
+        );
+        let session_id = serde_json::from_str::<Value>(&resp).unwrap()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Send first prompt to bind conversation and persist state
-        let (_text, resp1) = send_prompt_wait(&mut stdin, &mut reader, 3, &session_id, "Reply with exactly: FIRST_TURN");
-        assert!(resp1["error"].is_null(), "First turn error: {}", resp1["error"]);
+        let (_text, resp1) = send_prompt_wait(
+            &mut stdin,
+            &mut reader,
+            3,
+            &session_id,
+            "Reply with exactly: FIRST_TURN",
+        );
+        assert!(
+            resp1["error"].is_null(),
+            "First turn error: {}",
+            resp1["error"]
+        );
 
         // Send second prompt on the same session — this confirms multi-turn works
         // (session/load is already tested in unit tests; here we just verify the session
         // can handle continued prompts after binding)
-        let (text2, resp2) = send_prompt_wait(&mut stdin, &mut reader, 4, &session_id, "Reply with exactly one word: SECOND");
-        assert!(resp2["error"].is_null(), "Second turn error: {}", resp2["error"]);
+        let (text2, resp2) = send_prompt_wait(
+            &mut stdin,
+            &mut reader,
+            4,
+            &session_id,
+            "Reply with exactly one word: SECOND",
+        );
+        assert!(
+            resp2["error"].is_null(),
+            "Second turn error: {}",
+            resp2["error"]
+        );
         assert!(text2.is_some(), "Expected response on continued session");
 
         drop(stdin);
@@ -1152,17 +1465,34 @@ mod tests {
     #[test]
     #[ignore]
     fn test_e2e_error_paths() {
-        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else { return };
+        let Some((mut stdin, mut reader, mut child)) = spawn_agy_acp() else {
+            return;
+        };
 
-        send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#);
+        send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientName":"e2e","clientVersion":"0.1"}}"#,
+        );
 
         // Load a non-existent session
-        let resp = send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"non-existent-session"}}"#);
+        let resp = send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"non-existent-session"}}"#,
+        );
         let val: Value = serde_json::from_str(&resp).unwrap();
-        assert!(!val["error"].is_null(), "Expected error for unknown session");
+        assert!(
+            !val["error"].is_null(),
+            "Expected error for unknown session"
+        );
 
         // Unknown method
-        let resp = send_recv(&mut stdin, &mut reader, r#"{"jsonrpc":"2.0","id":3,"method":"bogus/method","params":{}}"#);
+        let resp = send_recv(
+            &mut stdin,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":3,"method":"bogus/method","params":{}}"#,
+        );
         let val: Value = serde_json::from_str(&resp).unwrap();
         assert!(!val["error"].is_null(), "Expected error for unknown method");
 
@@ -1192,8 +1522,9 @@ mod tests {
                 render_info BLOB,
                 step_payload BLOB,
                 step_format INTEGER NOT NULL DEFAULT 0
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Helper: build payload with field 20 (sub-msg) → field 1 (text)
         fn make_payload(text: &str) -> Vec<u8> {
@@ -1202,7 +1533,10 @@ mod tests {
             let mut inner = vec![0x0A]; // tag: field 1, wire type 2
             let mut len = text_bytes.len();
             loop {
-                if len < 128 { inner.push(len as u8); break; }
+                if len < 128 {
+                    inner.push(len as u8);
+                    break;
+                }
                 inner.push((len as u8 & 0x7F) | 0x80);
                 len >>= 7;
             }
@@ -1213,7 +1547,10 @@ mod tests {
             let mut outer = vec![0xA2, 0x01];
             let mut ilen = inner.len();
             loop {
-                if ilen < 128 { outer.push(ilen as u8); break; }
+                if ilen < 128 {
+                    outer.push(ilen as u8);
+                    break;
+                }
                 outer.push((ilen as u8 & 0x7F) | 0x80);
                 ilen >>= 7;
             }
@@ -1223,18 +1560,35 @@ mod tests {
 
         // step_type 0 = user, step_type 15 = response
         // Step 1: user prompt (step_type=0, no extractable text)
-        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 0, X'0801')", []).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 0, X'0801')",
+            [],
+        )
+        .unwrap();
         // Step 2: bot response "hello"
-        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
-            rusqlite::params![2i64, make_payload("hello")]).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![2i64, make_payload("hello")],
+        )
+        .unwrap();
         // Step 3: user prompt
-        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (3, 0, X'0802')", []).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (3, 0, X'0802')",
+            [],
+        )
+        .unwrap();
         // Step 4: bot response "world"
-        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
-            rusqlite::params![4i64, make_payload("world")]).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![4i64, make_payload("world")],
+        )
+        .unwrap();
         // Step 5: bot response multi-line
-        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
-            rusqlite::params![5i64, make_payload("line1\nline2\nline3")]).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+            rusqlite::params![5i64, make_payload("line1\nline2\nline3")],
+        )
+        .unwrap();
         drop(conn);
 
         let adapter = Adapter {
@@ -1246,7 +1600,10 @@ mod tests {
 
         // From start: get all response steps
         let result = adapter.read_response_from_db("multi", -1);
-        assert_eq!(result, Some(("hello\nworld\nline1\nline2\nline3".to_string(), 5)));
+        assert_eq!(
+            result,
+            Some(("hello\nworld\nline1\nline2\nline3".to_string(), 5))
+        );
 
         // After step 2: skip "hello", get "world" + multi-line
         let result = adapter.read_response_from_db("multi", 2);
@@ -1272,7 +1629,8 @@ mod tests {
 
         let db_path = conv_dir.join("empty.db");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE other (id INTEGER)").unwrap();
+        conn.execute_batch("CREATE TABLE other (id INTEGER)")
+            .unwrap();
         drop(conn);
 
         let adapter = Adapter {
@@ -1291,14 +1649,20 @@ mod tests {
     #[test]
     fn test_is_narration_true() {
         assert!(Adapter::is_narration("I will fetch the latest commits."));
-        assert!(Adapter::is_narration("I will fetch the latest commits.\nI will check the diff."));
-        assert!(Adapter::is_narration("I will read the file.\n\nI will analyze the output."));
+        assert!(Adapter::is_narration(
+            "I will fetch the latest commits.\nI will check the diff."
+        ));
+        assert!(Adapter::is_narration(
+            "I will read the file.\n\nI will analyze the output."
+        ));
     }
 
     #[test]
     fn test_is_narration_false() {
         assert!(!Adapter::is_narration("Here is the result."));
-        assert!(!Adapter::is_narration("I will fetch the commits.\nHere is the result."));
+        assert!(!Adapter::is_narration(
+            "I will fetch the commits.\nHere is the result."
+        ));
         assert!(!Adapter::is_narration(""));
     }
 
@@ -1324,7 +1688,10 @@ mod tests {
             "I will also note this is fine.".to_string(),
         ];
         let result = Adapter::filter_narration(&parts);
-        assert_eq!(result, "Here is my analysis.\nI will also note this is fine.");
+        assert_eq!(
+            result,
+            "Here is my analysis.\nI will also note this is fine."
+        );
         std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 

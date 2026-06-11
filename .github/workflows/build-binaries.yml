@@ -42,9 +42,11 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cargo build --manifest-path openab-agent/Cargo.toml --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package openab
         shell: bash
         run: |
           VERSION="${{ steps.tag.outputs.version }}"
@@ -59,6 +61,20 @@ jobs:
             tar czf ../${NAME}.tar.gz *
           fi
 
+      - name: Package openab-agent
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="openab-agent-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p dist-agent
+          cp openab-agent/target/${{ matrix.target }}/release/openab-agent${{ matrix.ext }} dist-agent/
+          cd dist-agent
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a ../${NAME}.zip *
+          else
+            tar czf ../${NAME}.tar.gz *
+          fi
+
       - name: Upload to release
         if: github.event_name == 'push'
         env:
@@ -67,15 +83,21 @@ jobs:
         run: |
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="openab-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
+          AGENT_NAME="openab-agent-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.archive }}"
           # Helm release uses openab-X.Y.Z tag, binary release uses vX.Y.Z tag
           # Try both — one will exist
           gh release upload "openab-${VERSION}" "$NAME" --clobber 2>/dev/null \
             || gh release upload "${{ steps.tag.outputs.tag }}" "$NAME" --clobber \
+            || true
+          gh release upload "openab-${VERSION}" "$AGENT_NAME" --clobber 2>/dev/null \
+            || gh release upload "${{ steps.tag.outputs.tag }}" "$AGENT_NAME" --clobber \
             || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: openab-${{ matrix.os }}-${{ matrix.arch }}
-          path: openab-*.${{ matrix.archive }}
+          path: |
+            openab-*.${{ matrix.archive }}
+            openab-agent-*.${{ matrix.archive }}
           retention-days: 7

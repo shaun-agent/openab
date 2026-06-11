@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'Dockerfile*'
+      - 'openshell/**'
       - 'src/**'
       - 'Cargo.*'
 
@@ -24,7 +25,7 @@ jobs:
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio" }
           - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "" }
           - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "" }
-          - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "" }
+          - { dockerfile: openshell/Dockerfile, suffix: "-openshell-workspace", neutral_workspace: true, agent: "", agent_args: "" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -33,6 +34,7 @@ jobs:
         run: docker build -t openab-test${{ matrix.variant.suffix }} -f ${{ matrix.variant.dockerfile }} .
 
       - name: Verify openab CMD does not crash
+        if: ${{ matrix.variant.neutral_workspace != true }}
         run: |
           OUTPUT=$(docker run --rm openab-test${{ matrix.variant.suffix }} 2>&1 || true)
           if echo "$OUTPUT" | grep -q "unrecognized subcommand"; then
@@ -41,10 +43,24 @@ jobs:
           fi
           echo "✅ openab CMD ok"
 
+      - name: Verify neutral OpenShell workspace image
+        if: ${{ matrix.variant.neutral_workspace == true }}
+        run: |
+          docker run --rm --entrypoint sh openab-test${{ matrix.variant.suffix }} -lc '
+            test -w /sandbox
+            command -v curl
+            command -v tar
+            ! command -v openab
+            ! command -v openab-agent
+          '
+          echo "✅ OpenShell workspace image is neutral and runtime-install ready"
+
       - name: Verify agent CLI exists
+        if: ${{ matrix.variant.neutral_workspace != true }}
         run: docker run --rm --entrypoint which openab-test${{ matrix.variant.suffix }} ${{ matrix.variant.agent }}
 
       - name: Verify agent responds
+        if: ${{ matrix.variant.neutral_workspace != true }}
         run: |
           INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 

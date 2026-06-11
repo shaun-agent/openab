@@ -1,7 +1,14 @@
-FROM ghcr.io/openabdev/openab-native:beta
+FROM debian:bookworm-slim
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    dpkg \
+    gzip \
+    tar \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd -g 1000660000 sandbox && \
     useradd -u 1000660000 -g sandbox -m -d /sandbox -s /bin/bash sandbox && \
     mkdir -p \

@@ -308,13 +308,6 @@ impl Adapter {
         if trimmed.contains('\0') {
             return false;
         }
-        if Uuid::parse_str(trimmed).is_ok() {
-            return false;
-        }
-        let uuid_like = trimmed.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-        if uuid_like.len() == 36 && Uuid::parse_str(uuid_like).is_ok() {
-            return false;
-        }
         if trimmed
             .chars()
             .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
@@ -809,23 +802,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn with_tool_display<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let previous = std::env::var("OPENAB_TOOL_DISPLAY").ok();
-        match value {
-            Some(value) => std::env::set_var("OPENAB_TOOL_DISPLAY", value),
-            None => std::env::remove_var("OPENAB_TOOL_DISPLAY"),
-        }
-        let result = f();
-        match previous {
-            Some(previous) => std::env::set_var("OPENAB_TOOL_DISPLAY", previous),
-            None => std::env::remove_var("OPENAB_TOOL_DISPLAY"),
-        }
-        result
-    }
 
     #[test]
     fn test_extract_text_from_step_payload_field20_field1() {
@@ -1138,48 +1114,15 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_text_from_step_payload_rejects_uuid_metadata() {
-        fn len_field(field_number: u64, bytes: &[u8]) -> Vec<u8> {
-            fn push_varint(mut value: u64, out: &mut Vec<u8>) {
-                loop {
-                    if value < 128 {
-                        out.push(value as u8);
-                        break;
-                    }
-                    out.push(((value as u8) & 0x7f) | 0x80);
-                    value >>= 7;
-                }
-            }
-
-            let mut out = Vec::new();
-            push_varint((field_number << 3) | 2, &mut out);
-            push_varint(bytes.len() as u64, &mut out);
-            out.extend_from_slice(bytes);
-            out
-        }
-
-        let metadata = len_field(1, b"15948fc8-fbed-467b-8404-fefadfc145c6");
-        let reply = len_field(7, b"actual assistant reply");
-        let mut payload = len_field(20, &metadata);
-        payload.extend_from_slice(&len_field(31, &reply));
-
-        assert_eq!(
-            Adapter::extract_text_from_step_payload(&payload),
-            Some("actual assistant reply".to_string())
-        );
-    }
-
-    #[test]
     fn test_stdout_fallback_filters_empty_and_narration() {
-        with_tool_display(Some("compact"), || {
-            let stdout =
-                "\n\nI will inspect the repo.\n\nGitHub CLI is installed and authenticated.\n";
-            assert_eq!(
-                Adapter::stdout_fallback_text(stdout),
-                Some("GitHub CLI is installed and authenticated.".to_string())
-            );
-            assert_eq!(Adapter::stdout_fallback_text("\n\n"), None);
-        });
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let stdout = "\n\nI will inspect the repo.\n\nGitHub CLI is installed and authenticated.\n";
+        assert_eq!(
+            Adapter::stdout_fallback_text(stdout),
+            Some("GitHub CLI is installed and authenticated.".to_string())
+        );
+        assert_eq!(Adapter::stdout_fallback_text("\n\n"), None);
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 
     /// Check auth is available: either GEMINI_API_KEY env var or local keyring.
@@ -1725,55 +1668,54 @@ mod tests {
 
     #[test]
     fn test_filter_narration_drops_leading_narration() {
-        with_tool_display(Some("compact"), || {
-            let parts = vec![
-                "I will fetch the latest commits.\nI will check the diff.".to_string(),
-                "I will read the file.".to_string(),
-                "The fix is confirmed! LGTM ✅".to_string(),
-            ];
-            let result = Adapter::filter_narration(&parts);
-            assert_eq!(result, "The fix is confirmed! LGTM ✅");
-        });
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let parts = vec![
+            "I will fetch the latest commits.\nI will check the diff.".to_string(),
+            "I will read the file.".to_string(),
+            "The fix is confirmed! LGTM ✅".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "The fix is confirmed! LGTM ✅");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 
     #[test]
     fn test_filter_narration_preserves_content_after_first_non_narration() {
-        with_tool_display(Some("none"), || {
-            let parts = vec![
-                "I will check things.".to_string(),
-                "Here is my analysis.".to_string(),
-                "I will also note this is fine.".to_string(),
-            ];
-            let result = Adapter::filter_narration(&parts);
-            assert_eq!(
-                result,
-                "Here is my analysis.\nI will also note this is fine."
-            );
-        });
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "none");
+        let parts = vec![
+            "I will check things.".to_string(),
+            "Here is my analysis.".to_string(),
+            "I will also note this is fine.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(
+            result,
+            "Here is my analysis.\nI will also note this is fine."
+        );
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 
     #[test]
     fn test_filter_narration_full_mode() {
-        with_tool_display(Some("full"), || {
-            let parts = vec![
-                "I will fetch commits.".to_string(),
-                "Final answer here.".to_string(),
-            ];
-            let result = Adapter::filter_narration(&parts);
-            assert_eq!(result, "I will fetch commits.\nFinal answer here.");
-        });
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "full");
+        let parts = vec![
+            "I will fetch commits.".to_string(),
+            "Final answer here.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will fetch commits.\nFinal answer here.");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 
     #[test]
     fn test_filter_narration_unset_defaults_to_full() {
-        with_tool_display(None, || {
-            let parts = vec![
-                "I will fetch commits.".to_string(),
-                "Final answer here.".to_string(),
-            ];
-            let result = Adapter::filter_narration(&parts);
-            assert_eq!(result, "I will fetch commits.\nFinal answer here.");
-        });
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+        let parts = vec![
+            "I will fetch commits.".to_string(),
+            "Final answer here.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will fetch commits.\nFinal answer here.");
     }
 
     #[test]
@@ -1785,14 +1727,14 @@ mod tests {
 
     #[test]
     fn test_filter_narration_all_narration_keeps_last() {
-        with_tool_display(Some("compact"), || {
-            let parts = vec![
-                "I will fetch the file.".to_string(),
-                "I will check the output.".to_string(),
-                "I will verify the fix.".to_string(),
-            ];
-            let result = Adapter::filter_narration(&parts);
-            assert_eq!(result, "I will verify the fix.");
-        });
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let parts = vec![
+            "I will fetch the file.".to_string(),
+            "I will check the output.".to_string(),
+            "I will verify the fix.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will verify the fix.");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 }
